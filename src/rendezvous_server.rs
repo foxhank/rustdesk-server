@@ -1,7 +1,7 @@
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
-    allow_err, bail,
+    allow_err, anyhow::anyhow, bail,
     bytes::{Bytes, BytesMut},
     bytes_codec::BytesCodec,
     config,
@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -25,18 +25,18 @@ use hbb_common::{
         sync::{mpsc, Mutex},
         time::{interval, Duration},
     },
-    tokio_util::codec::Framed,
+    tokio_util::codec::{Decoder, Encoder, Framed},
     try_into_v4,
     udp::FramedSocket,
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
 
@@ -48,12 +48,110 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
-type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
+const SECURE_TCP_HANDSHAKE_TIMEOUT: u64 = 10_000;
+type TcpStreamSink = SplitSink<Framed<TcpStream, SecureCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
 }
+
+/// A codec that transparently applies the secure-tcp (Pro `KeyExchange`)
+/// encryption on top of the normal length-prefixed framing once the handshake
+/// slot is filled. The slot is shared with the handshake code so encryption can
+/// be switched on after the framing has been split into sink/stream halves.
+#[derive(Clone)]
+struct SecureCodec {
+    codec: BytesCodec,
+    encrypt: Arc<StdMutex<Option<Encrypt>>>,
+}
+
+impl SecureCodec {
+    fn new(encrypt: Arc<StdMutex<Option<Encrypt>>>) -> Self {
+        Self {
+            codec: BytesCodec::new(),
+            encrypt,
+        }
+    }
+}
+
+impl Decoder for SecureCodec {
+    type Item = BytesMut;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, std::io::Error> {
+        match self.codec.decode(src)? {
+            Some(mut frame) => {
+                if let Some(encrypt) = self.encrypt.lock().unwrap().as_mut() {
+                    encrypt.dec(&mut frame)?;
+                }
+                Ok(Some(frame))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl Encoder<Bytes> for SecureCodec {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, data: Bytes, buf: &mut BytesMut) -> Result<(), std::io::Error> {
+        if let Some(encrypt) = self.encrypt.lock().unwrap().as_mut() {
+            return self.codec.encode(Bytes::from(encrypt.enc(&data)), buf);
+        }
+        self.codec.encode(data, buf)
+    }
+}
+
+/// Server side of the secure-tcp handshake spoken by RustDesk client >= 1.4.x
+/// when the user is logged in (`secure_tcp` in the client's common.rs):
+/// 1. send `KeyExchange{keys:[sign(ephemeral_pk)]}` signed by the server's
+///    ed25519 identity key (the key whose base64 public half is configured as
+///    the client's "Key");
+/// 2. expect `KeyExchange{keys:[client_ephemeral_pk, sealed_symmetric_key]}`
+///    back, where the symmetric key is crypto_box sealed (zero nonce) to our
+///    ephemeral public key - `Encrypt::decode` opens it;
+/// 3. from then on every frame payload is secretbox-encrypted with 24-byte
+///    zero nonce prefixed by the u64 LE sequence number, separately counted
+///    per direction starting from 1 (see hbb_common tcp.rs `Encrypt`).
+///
+/// Clients that do not secure the connection (anonymous, or patched builds)
+/// ignore the extra KeyExchange message and keep talking plaintext, so the
+/// first non-KeyExchange frame is returned to the caller untouched.
+async fn secure_tcp_handshake(
+    framed: &mut Framed<TcpStream, SecureCodec>,
+    sk: &sign::SecretKey,
+    encrypt: &Arc<StdMutex<Option<Encrypt>>>,
+) -> ResultType<(bool, Option<BytesMut>)> {
+    let (our_pk, our_sk) = box_::gen_keypair();
+    let signed_pk = sign::sign(&our_pk.0, sk);
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_key_exchange(KeyExchange {
+        keys: vec![Bytes::from(signed_pk.0)],
+        ..Default::default()
+    });
+    let out = msg_out
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize KeyExchange: {e}"))?;
+    framed.send(Bytes::from(out)).await?;
+    match timeout(SECURE_TCP_HANDSHAKE_TIMEOUT, framed.next()).await {
+        Ok(Some(Ok(bytes))) => {
+            if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                    if ex.keys.len() == 2 {
+                        let key = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk)?;
+                        encrypt.lock().unwrap().replace(Encrypt::new(key));
+                        return Ok((true, None));
+                    }
+                }
+            }
+            Ok((false, Some(bytes)))
+        }
+        Ok(Some(Err(err))) => Err(err.into()),
+        _ => bail!("handshake timeout or connection closed"),
+    }
+}
+
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
@@ -1215,11 +1313,37 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let encrypt = Arc::new(StdMutex::new(None));
+            let mut framed = Framed::new(stream, SecureCodec::new(encrypt.clone()));
+            let mut first_frame = None;
+            // Offer the secure-tcp handshake so logged-in clients (which
+            // require it since client 1.4.x) can encrypt the rendezvous
+            // connection. Anonymous/patched clients simply ignore the
+            // KeyExchange message and keep talking plaintext.
+            if let Some(sk) = self.inner.sk.as_ref() {
+                match secure_tcp_handshake(&mut framed, sk, &encrypt).await {
+                    Ok((true, _)) => {}
+                    Ok((false, bytes)) => first_frame = bytes,
+                    Err(err) => {
+                        log::info!("secure tcp handshake failed from {:?}: {}", addr, err);
+                        return Ok(());
+                    }
+                }
+            }
+            let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+            let mut alive = true;
+            if let Some(bytes) = first_frame.take() {
+                alive = self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
+            }
+            while alive {
+                match timeout(30_000, b.next()).await {
+                    Ok(Some(Ok(bytes))) => {
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                            break;
+                        }
+                    }
+                    _ => break,
                 }
             }
         }
