@@ -127,7 +127,7 @@ async fn secure_tcp_handshake(
     let signed_pk = sign::sign(&our_pk.0, sk);
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_key_exchange(KeyExchange {
-        keys: vec![Bytes::from(signed_pk.0)],
+        keys: vec![Bytes::from(signed_pk)],
         ..Default::default()
     });
     let out = msg_out
